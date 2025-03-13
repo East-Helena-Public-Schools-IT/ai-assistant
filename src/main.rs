@@ -1,4 +1,4 @@
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::join};
 use langchain_rust::{
     chain::{Chain, ConversationalRetrieverChainBuilder},
     document_loaders::{Loader, pdf_extract_loader::PdfExtractLoader},
@@ -13,8 +13,14 @@ use langchain_rust::{
     template_jinja2,
     vectorstore::{Retriever, VecStoreOptions, VectorStore, surrealdb::StoreBuilder},
 };
-use std::{io::Write, sync::Arc};
+use std::{io::Write, sync::Arc, time::Duration};
 use surrealdb::{Surreal, engine::any::Any};
+use tokio::{
+    fs,
+    io::{AsyncWriteExt, stdout},
+    sync::RwLock,
+    time::sleep,
+};
 
 #[tokio::main]
 async fn main() {
@@ -50,6 +56,7 @@ async fn main() {
         .add_documents(&get_documents().await, &VecStoreOptions::default())
         .await
         .unwrap();
+    println!("Done storing");
 
     let prompt = message_formatter![
         fmt_message!(Message::new_system_message("You are a helpful assistant")),
@@ -89,23 +96,49 @@ Helpful Answer:
             "question" => query,
         };
 
+        // TODO how do you get it to respond with the file name as well?
         let res = chain.invoke(input).await.unwrap();
         println!("{}", res);
     }
 }
 
 async fn get_documents() -> Vec<Document> {
-    // TODO loop thru all docuemnts
-    let loader =
-        PdfExtractLoader::from_path("./pdfs/GPT Project/Absence-Request-Processing.pdf").unwrap();
-    let docs = loader
-        .load()
-        .await
-        .unwrap()
-        .map(|d| d.unwrap())
-        .collect::<Vec<_>>()
-        .await;
+    // let mut docs: Vec<Document> = Vec::new();
+    let mut futures = Vec::new();
 
+    let mut contents = fs::read_dir("./pdfs/GPT Project/").await.unwrap();
+
+    println!("Starting...");
+    while let Ok(file) = contents.next_entry().await {
+        if let Some(file) = file {
+            if let Some(name) = file.file_name().to_str() {
+                if name.ends_with("pdf") {
+                    let fut = tokio::spawn(async move {
+                        if let Ok(loader) = PdfExtractLoader::from_path(file.path()) {
+                            if let Ok(loaded) = loader.load().await {
+                                let doc = loaded.map(|d| d.unwrap()).collect::<Vec<_>>().await;
+                                println!("Doc parsed.");
+                                return doc.into_iter().nth(0);
+                            }
+                        }
+                        return None;
+                    });
+                    futures.push(fut);
+                }
+            }
+        }
+    }
+
+    let s = futures_util::future::join_all(futures).await;
+
+    let docs = s
+        .into_iter()
+        .filter_map(|f| f.ok())
+        .filter(|f| f.is_some())
+        .map(|f| f.unwrap())
+        .collect();
+
+    println!("Done parsing");
     docs
 }
 
