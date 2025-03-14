@@ -1,4 +1,4 @@
-use futures_util::{StreamExt, future::join};
+use futures_util::StreamExt;
 use langchain_rust::{
     chain::{Chain, ConversationalRetrieverChainBuilder},
     document_loaders::{Loader, pdf_extract_loader::PdfExtractLoader},
@@ -13,13 +13,11 @@ use langchain_rust::{
     template_jinja2,
     vectorstore::{Retriever, VecStoreOptions, VectorStore, surrealdb::StoreBuilder},
 };
-use std::{io::Write, sync::Arc, time::Duration};
+use serde_json::json;
+use std::{io::Write, sync::Arc};
 use surrealdb::{Surreal, engine::any::Any};
 use tokio::{
-    fs,
-    io::{AsyncWriteExt, stdout},
-    sync::RwLock,
-    time::sleep,
+    fs, task::JoinSet
 };
 
 #[tokio::main]
@@ -87,10 +85,11 @@ Helpful Answer:
 
     loop {
         // Ask for user input
-        print!("Ask> ");
+        print!("\nAsk> ");
         std::io::stdout().flush().unwrap();
         let mut query = String::new();
         std::io::stdin().read_line(&mut query).unwrap();
+        println!("\n");
 
         let input = prompt_args! {
             "question" => query,
@@ -103,43 +102,51 @@ Helpful Answer:
 }
 
 async fn get_documents() -> Vec<Document> {
-    // let mut docs: Vec<Document> = Vec::new();
-    let mut futures = Vec::new();
+    let mut futures = JoinSet::new();
 
-    let mut contents = fs::read_dir("./pdfs/GPT Project/").await.unwrap();
+    let mut contents = fs::read_dir("./pdfs/").await.unwrap();
 
-    println!("Starting...");
+    // loop thru all entries in the folder
     while let Ok(file) = contents.next_entry().await {
         if let Some(file) = file {
             if let Some(name) = file.file_name().to_str() {
+                let name = name.to_string();
+                // take only pdfs
                 if name.ends_with("pdf") {
+                    // multi-thread because it's cpu intensive
                     let fut = tokio::spawn(async move {
                         if let Ok(loader) = PdfExtractLoader::from_path(file.path()) {
                             if let Ok(loaded) = loader.load().await {
                                 let doc = loaded.map(|d| d.unwrap()).collect::<Vec<_>>().await;
-                                println!("Doc parsed.");
-                                return doc.into_iter().nth(0);
+                                assert_eq!(doc.len(), 1);
+
+                                // get the parsed document to modify metadata
+                                if let Some(mut document) = doc.into_iter().next() {
+                                    println!("{name} - ✅");
+
+                                    // TODO how do we get this back at the end?
+                                    document.metadata.insert("document_name".to_string(), name.into());
+                                    return Some(document);
+                                }
                             }
                         }
-                        return None;
+                        println!("{name} - ❌");
+                        None
                     });
-                    futures.push(fut);
+                    futures.spawn(fut);
                 }
             }
+        } else {
+            break
         }
     }
 
-    let s = futures_util::future::join_all(futures).await;
-
-    let docs = s
+    let results = futures.join_all().await;
+    results
         .into_iter()
-        .filter_map(|f| f.ok())
-        .filter(|f| f.is_some())
-        .map(|f| f.unwrap())
-        .collect();
-
-    println!("Done parsing");
-    docs
+        .flatten()
+        .flatten()
+        .collect()
 }
 
 async fn get_db() -> Surreal<Any> {
@@ -147,26 +154,16 @@ async fn get_db() -> Surreal<Any> {
         .set_strict(true)
         .capabilities(surrealdb::opt::capabilities::Capabilities::all());
     // .user(surrealdb::opt::auth::Root {
-    // jusername: "root".into(),
-    // jpassword: "root".into(),
-    // j});
+    // username: "root".into(),
+    // password: "root".into(),
+    // });
 
     let db = surrealdb::engine::any::connect(("ws://localhost:8000", surrealdb_config))
         .await
         .unwrap();
-    db.query("DEFINE NAMESPACE IF NOT EXISTS test;")
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-    db.query("USE NAMESPACE test; DEFINE DATABASE IF NOT EXISTS test;")
-        .await
-        .unwrap()
-        .check()
-        .unwrap();
-
     db.use_ns("test").await.unwrap();
     db.use_db("test").await.unwrap();
 
     db
 }
+
