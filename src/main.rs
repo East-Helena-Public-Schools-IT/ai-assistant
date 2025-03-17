@@ -14,6 +14,7 @@ use langchain_rust::{
     template_jinja2,
     vectorstore::{Retriever, VecStoreOptions, VectorStore, surrealdb::StoreBuilder},
 };
+use serde_json::from_value;
 use std::{io::Write, sync::Arc};
 use surrealdb::{Surreal, engine::any::Any};
 use tokio::{
@@ -27,7 +28,7 @@ async fn main() {
     let start_time = Instant::now();
 
     // Connect to ollama
-    let client = Arc::new(OllamaClient::try_new("http://10.22.98.20:11434").unwrap());
+    let client = Arc::new(OllamaClient::try_new("http://10.22.98.20:11434").expect("Failed to connect to Ollama"));
     let embedder = OllamaEmbedder::new(client.clone(), "nomic-embed-text", None);
     let llm = Ollama::new(client.clone(), "llama3.2", None);
 
@@ -37,7 +38,7 @@ async fn main() {
     //
     // Technically it would be better to hard-code this value then we wouldn't
     // be doing extra embeds.
-    let dimension = embedder.embed_query("test query").await.unwrap().len();
+    let dimension = embedder.embed_query("test query").await.expect("Test embed failed").len();
     println!("{color_yellow}Discovered vector dimensions to be {dimension}{color_reset}");
 
     // Get db
@@ -50,10 +51,10 @@ async fn main() {
         .vector_dimensions(dimension as i32)
         .build()
         .await
-        .unwrap();
+        .expect("Failed to create store");
 
     // Intialize the tables in the database. This is required to be done only once.
-    store.initialize().await.unwrap();
+    store.initialize().await.expect("Failed to init db schema");
 
     // read the dir
     let mut dir = fs::read_dir("./pdfs")
@@ -103,13 +104,13 @@ async fn main() {
     let pdfs_to_store = results.into_iter().flatten().flatten().collect();
 
     store
-        .add_documents(&embed_pdfs(pdfs_to_store).await, &VecStoreOptions::default())
+        .add_documents(&embed_pdfs(pdfs_to_store).await, None)
         .await
-        .unwrap();
+        .expect("Failed to store documents");
 
     let prompt = message_formatter![
         fmt_message!(Message::new_system_message(
-            "You are a helpful assistant, helping new users of Infinite Campus use it."
+            "You are a helpful assistant, helping new users so be verbose."
         )),
         fmt_template!(HumanMessagePromptTemplate::new(template_jinja2!(
             "
@@ -127,7 +128,7 @@ Helpful Answer:
         )))
     ];
 
-    let retriever = Retriever::new(store, 20).with_options(VecStoreOptions {
+    let retriever = Retriever::new(store, 5).with_options(VecStoreOptions {
         score_threshold: Some(0.5),
         ..Default::default()
     });
@@ -157,9 +158,20 @@ Helpful Answer:
             "question" => query,
         };
 
-        // TODO how do you get it to respond with the file name as well?
-        let res = chain.invoke(input).await.unwrap();
-        println!("{}", res);
+        if let Ok(res) = chain.call(input).await {
+            if let Some(sources) = &res.sources {
+                for i in sources {
+                    if let Some(name) = i.metadata.get("document_name") {
+                        if let Ok(s) = from_value::<String>(name.clone()) {
+                            println!("{color_green}./pdfs/{}{color_reset}", s);
+                        }
+                    }
+                }
+            }
+            println!("{}", &res.generation);
+        } else {
+            eprintln!("{color_red}There was an error calling the chain{color_reset}");
+        }
     }
 }
 
@@ -176,7 +188,7 @@ async fn embed_pdfs(pdfs: Vec<DirEntry>) -> Vec<Document> {
             let fut = tokio::spawn(async move {
                 if let Ok(loader) = PdfExtractLoader::from_path(file.path()) {
                     if let Ok(loaded) = loader.load().await {
-                        let doc = loaded.map(|d| d.unwrap()).collect::<Vec<_>>().await;
+                        let doc = loaded.map(|d| d.expect("Loading pdf errored")).collect::<Vec<_>>().await;
                         assert_eq!(doc.len(), 1);
 
                         // get the parsed document to modify metadata
@@ -217,9 +229,9 @@ async fn get_db() -> Surreal<Any> {
 
     let db = surrealdb::engine::any::connect(("ws://localhost:8000", surrealdb_config))
         .await
-        .unwrap();
-    db.use_ns("test").await.unwrap();
-    db.use_db("test").await.unwrap();
+        .expect("Failed to connect to surrealdb");
+    db.use_ns("test").await.expect("Failed to connect to ns");
+    db.use_db("test").await.expect("Failed to connect to db");
 
     db
 }
